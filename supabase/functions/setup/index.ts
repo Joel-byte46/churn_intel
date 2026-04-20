@@ -1,4 +1,5 @@
 import { supabaseAdmin } from '../_shared/clients.ts'
+import { resolveModel } from '../_shared/config.ts'
 
 const ANTHROPIC_TEST_URL = 'https://api.anthropic.com/v1/messages'
 
@@ -10,9 +11,11 @@ Deno.serve(async (req) => {
       return json({ error: 'Missing authorization header' }, 401)
     }
 
+    const token = authHeader.replace('Bearer ', '')
+
     const { data: { user }, error: authError } = await supabaseAdmin
       .auth
-      .getUser(authHeader.replace('Bearer ', ''))
+      .getUser(token)
 
     if (authError || !user) {
       return json({ error: 'Unauthorized' }, 401)
@@ -25,7 +28,10 @@ Deno.serve(async (req) => {
       return json({ error: 'Invalid key format' }, 400)
     }
 
-    // 3. Valide la clé — appel test minimal
+    // 3. Détermine le modèle de test (FAST par défaut système)
+    const model = resolveModel('FAST', null)
+
+    // 4. Valide la clé — appel test minimal
     const testRes = await fetch(ANTHROPIC_TEST_URL, {
       method: 'POST',
       headers: {
@@ -34,21 +40,21 @@ Deno.serve(async (req) => {
         'content-type': 'application/json'
       },
       body: JSON.stringify({
-        model: 'claude-3-5-sonnet-20241022',
+        model,
         max_tokens: 10,
         messages: [{ role: 'user', content: 'ping' }]
       })
     })
 
     if (!testRes.ok) {
-      const err = await testRes.json()
+      const err = await testRes.json().catch(() => null)
       return json({
         error: 'Invalid Anthropic key',
         detail: err?.error?.message ?? 'Unknown error'
       }, 400)
     }
 
-    // 4. Stocke dans Vault via la fonction SQL sécurisée
+    // 5. Stocke dans Vault via la fonction SQL sécurisée
     const { error: vaultError } = await supabaseAdmin
       .rpc('store_anthropic_key', {
         p_user_id: user.id,
@@ -64,7 +70,7 @@ Deno.serve(async (req) => {
       return json({ error: 'Failed to store key' }, 500)
     }
 
-    // 5. Met à jour le profil user
+    // 6. Met à jour le profil user
     const { error: updateError } = await supabaseAdmin
       .from('users')
       .update({
@@ -79,11 +85,11 @@ Deno.serve(async (req) => {
 
     console.log(JSON.stringify({
       event: 'setup.completed',
-      user_id: user.id
+      user_id: user.id,
+      model_tested: model
     }))
 
-    // 6. Déclenche le premier cycle d'analyse
-    // Fire and forget — on ne bloque pas la réponse
+    // 7. Déclenche le premier cycle d'analyse (fire & forget)
     supabaseAdmin.functions.invoke('connect', {
       body: { user_id: user.id }
     }).catch((err) => {
@@ -105,10 +111,9 @@ Deno.serve(async (req) => {
   }
 })
 
-// Helper
 function json(data: object, status: number) {
   return new Response(JSON.stringify(data), {
     status,
     headers: { 'Content-Type': 'application/json' }
   })
-}
+  }
