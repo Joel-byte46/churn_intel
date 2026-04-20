@@ -1,7 +1,7 @@
 import { supabaseAdmin } from '../_shared/clients.ts'
 import Anthropic from 'https://esm.sh/@anthropic-ai/sdk@0.27?target=deno'
+import { resolveModel } from '../_shared/config.ts'
 
-const MODEL = 'claude-3-5-sonnet-20241022'
 const RESEND_URL = 'https://api.resend.com/emails'
 
 const SUBJECT_BY_POSITION: Record<string, string> = {
@@ -19,35 +19,38 @@ Deno.serve(async (req) => {
       return json({ error: 'Missing user_id' }, 400)
     }
 
-    // 1. Récupère le dernier benchmark
-    const { data: benchmark, error: benchmarkError } = await supabaseAdmin
-      .from('benchmark_results')
-      .select('*')
-      .eq('user_id', user_id)
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .single()
+    // 1. Récupère le benchmark + le user en parallèle
+    const [benchmarkResult, userResult, keyResult] = await Promise.all([
+      supabaseAdmin
+        .from('benchmark_results')
+        .select('*')
+        .eq('user_id', user_id)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .single(),
+      supabaseAdmin
+        .from('users')
+        .select('email, first_name, product_name, preferred_model')
+        .eq('id', user_id)
+        .single(),
+      supabaseAdmin
+        .rpc('get_anthropic_key', { p_user_id: user_id })
+    ])
 
-    if (benchmarkError || !benchmark) {
+    if (benchmarkResult.error || !benchmarkResult.data) {
       return json({ error: 'Benchmark not found' }, 404)
     }
 
-    // 2. Récupère le user
-    const { data: user, error: userError } = await supabaseAdmin
-      .from('users')
-      .select('email, first_name, product_name')
-      .eq('id', user_id)
-      .single()
-
-    if (userError || !user) {
+    if (userResult.error || !userResult.data) {
       return json({ error: 'User not found' }, 404)
     }
 
-    // 3. Récupère la clé Anthropic
-    const { data: anthropic_key } = await supabaseAdmin
-      .rpc('get_anthropic_key', { p_user_id: user_id })
+    const benchmark = benchmarkResult.data
+    const user = userResult.data
+    const anthropic_key = keyResult.data
+    const model = resolveModel('NARRATIVE', user.preferred_model)
 
-    // 4. Génère l'email
+    // 2. Génère l'email
     const position = benchmark.reading?.position ?? 'below_median'
     const subject = SUBJECT_BY_POSITION[position] ?? 'Your benchmark report is ready'
 
@@ -55,12 +58,12 @@ Deno.serve(async (req) => {
 
     if (anthropic_key) {
       const anthropic = new Anthropic({ apiKey: anthropic_key })
-      emailBody = await generateBenchmarkEmail(anthropic, user, benchmark)
+      emailBody = await generateBenchmarkEmail(anthropic, model, user, benchmark)
     } else {
       emailBody = buildFallbackBenchmarkEmail(user, benchmark)
     }
 
-    // 5. Envoie via Resend
+    // 3. Envoie via Resend
     const resendKey = Deno.env.get('RESEND_API_KEY')!
     const sent = await sendEmail(resendKey, user.email, subject, emailBody)
 
@@ -72,7 +75,7 @@ Deno.serve(async (req) => {
       }))
     }
 
-    // 6. Update email_sent_at
+    // 4. Update email_sent_at
     await supabaseAdmin
       .from('benchmark_results')
       .update({ email_sent_at: new Date().toISOString() })
@@ -81,11 +84,12 @@ Deno.serve(async (req) => {
     console.log(JSON.stringify({
       event: 'benchmark-report.sent',
       user_id,
+      model,
       position,
       to: user.email
     }))
 
-    // Fin du cycle initial
+    // Fin du cycle initial.
     // Le founder a ses 2 emails. L'autopilot prend le relais.
     return json({ status: 'sent', position }, 200)
 
@@ -103,6 +107,7 @@ Deno.serve(async (req) => {
 
 async function generateBenchmarkEmail(
   anthropic: Anthropic,
+  model: string,
   user: any,
   benchmark: any
 ): Promise<string> {
@@ -124,7 +129,7 @@ End with one concrete action they can take based on their position.`
 
   try {
     const response = await anthropic.messages.create({
-      model: MODEL,
+      model,
       max_tokens: 300,
       temperature: 0,
       messages: [{ role: 'user', content: prompt }]
@@ -222,4 +227,4 @@ function json(data: object, status: number) {
     status,
     headers: { 'Content-Type': 'application/json' }
   })
-}
+  }
