@@ -1,7 +1,8 @@
+
 import { supabaseAdmin } from '../_shared/clients.ts'
 import Anthropic from 'https://esm.sh/@anthropic-ai/sdk@0.27?target=deno'
+import { resolveModel } from '../_shared/config.ts'
 
-const MODEL = 'claude-3-5-sonnet-20241022'
 const RESEND_URL = 'https://api.resend.com/emails'
 
 Deno.serve(async (req) => {
@@ -12,26 +13,31 @@ Deno.serve(async (req) => {
       return json({ error: 'Missing user_id or analysis_id' }, 400)
     }
 
-    // 1. Récupère l'analyse + le user
-    const { data: analysis, error: analysisError } = await supabaseAdmin
-      .from('churn_analyses')
-      .select('*')
-      .eq('id', analysis_id)
-      .single()
+    // 1. Récupère l'analyse + le user en parallèle
+    const [analysisResult, userResult] = await Promise.all([
+      supabaseAdmin
+        .from('churn_analyses')
+        .select('*')
+        .eq('id', analysis_id)
+        .single(),
+      supabaseAdmin
+        .from('users')
+        .select('email, first_name, product_name, preferred_model')
+        .eq('id', user_id)
+        .single()
+    ])
 
-    if (analysisError || !analysis) {
+    if (analysisResult.error || !analysisResult.data) {
       return json({ error: 'Analysis not found' }, 404)
     }
 
-    const { data: user, error: userError } = await supabaseAdmin
-      .from('users')
-      .select('email, first_name, product_name')
-      .eq('id', user_id)
-      .single()
-
-    if (userError || !user) {
+    if (userResult.error || !userResult.data) {
       return json({ error: 'User not found' }, 404)
     }
+
+    const analysis = analysisResult.data
+    const user = userResult.data
+    const model = resolveModel('NARRATIVE', user.preferred_model)
 
     // 2. Récupère la clé Anthropic
     const { data: anthropic_key } = await supabaseAdmin
@@ -43,11 +49,10 @@ Deno.serve(async (req) => {
 
     if (anthropic_key) {
       const anthropic = new Anthropic({ apiKey: anthropic_key })
-      const generated = await generateEmail(anthropic, user, analysis)
+      const generated = await generateEmail(anthropic, model, user, analysis)
       emailBody = generated.body
       subject = generated.subject
     } else {
-      // Fallback : template brut sans Claude
       const fallback = buildFallbackEmail(user, analysis)
       emailBody = fallback.body
       subject = fallback.subject
@@ -58,7 +63,6 @@ Deno.serve(async (req) => {
     const sent = await sendEmail(resendKey, user.email, subject, emailBody)
 
     if (!sent) {
-      // Log mais ne bloque pas — le diagnostic est dans la DB
       console.error(JSON.stringify({
         event: 'report.email.failed',
         user_id,
@@ -76,6 +80,7 @@ Deno.serve(async (req) => {
       event: 'report.sent',
       user_id,
       analysis_id,
+      model,
       to: user.email
     }))
 
@@ -106,6 +111,7 @@ Deno.serve(async (req) => {
 
 async function generateEmail(
   anthropic: Anthropic,
+  model: string,
   user: any,
   analysis: any
 ): Promise<{ subject: string; body: string }> {
@@ -133,7 +139,7 @@ Write the email. Return ONLY valid JSON:
 
   try {
     const response = await anthropic.messages.create({
-      model: MODEL,
+      model,
       max_tokens: 512,
       temperature: 0,
       messages: [{ role: 'user', content: prompt }]
@@ -223,7 +229,6 @@ async function sendEmail(
       }))
     }
 
-    // Backoff : 1s, 4s, 16s
     if (attempt < retries - 1) {
       await sleep(1000 * Math.pow(4, attempt))
     }
