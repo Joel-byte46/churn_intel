@@ -1,0 +1,87 @@
+name: Deploy Revenue OS to Supabase Cloud
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Checkout
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 2. Install Supabase CLI (IMPORTANT)
+      - name: Install Supabase CLI
+        uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      # 3. Verify CLI install
+      - name: Verify Supabase CLI
+        run: supabase --version
+
+      # 4. Make scripts executable
+      - name: Prepare scripts
+        run: chmod +x fix-uuid.sh || true
+
+      # 5. Fix migrations
+      - name: Fix UUID strategy
+        run: bash fix-uuid.sh || true
+
+      # 6. Link project
+      - name: Link to Supabase Project
+        run: supabase link --project-ref "${{ secrets.SUPABASE_PROJECT_REF }}"
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+
+      # 7. Push DB migrations (NO PROMPT MODE)
+      - name: Push Database Migrations
+        run: supabase db push --yes
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+
+      # 8. Deploy Edge Functions (FIXED)
+      - name: Deploy Edge Functions
+        run: |
+          for func in supabase/functions/*; do
+            if [ -d "$func" ]; then
+
+              name=$(basename "$func")
+
+              # ❌ skip internal folders
+              if [[ "$name" == _* ]]; then
+                echo "Skipping $name"
+                continue
+              fi
+
+              # ❌ strict validation
+              if [[ ! "$name" =~ ^[A-Za-z][A-Za-z0-9_-]*$ ]]; then
+                echo "Invalid function name: $name"
+                continue
+              fi
+
+              echo "Deploying $name..."
+
+              supabase functions deploy "$name" \
+                --project-ref "${{ secrets.SUPABASE_PROJECT_REF }}" \
+                --no-verify-jwt
+
+            fi
+          done
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          
+      # 9. Success
+      - name: Notify Success
+        if: success()
+        run: echo "🚀 Revenue OS deployed successfully"
+
+      # 10. Failure
+      - name: Notify Failure
+        if: failure()
+        run: echo "❌ Deployment failed"
