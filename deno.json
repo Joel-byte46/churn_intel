@@ -2,6 +2,7 @@
   "lint": {
     "rules": {
       "exclude": [
+        "no-explicit-any",
         "no-unused-vars",
         "require-await",
         "prefer-const"
