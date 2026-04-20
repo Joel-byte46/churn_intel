@@ -1,9 +1,7 @@
 import { supabaseAdmin } from '../_shared/clients.ts'
 import Anthropic from 'https://esm.sh/@anthropic-ai/sdk@0.27?target=deno'
+import { resolveModel } from '../_shared/config.ts'
 
-const MODEL = 'claude-3-5-sonnet-20241022'
-
-// Templates de fallback par action type
 const FALLBACK_INTERVENTIONS: Record<string, any> = {
   CHURN_RISK: {
     subject: 'Quick question about your experience',
@@ -68,54 +66,57 @@ Deno.serve(async (req) => {
       return json({ error: 'Missing user_id, customer_id or action_type' }, 400)
     }
 
-    // 1. Récupère le job pending pour ce customer + action_type
-    const { data: job, error: jobError } = await supabaseAdmin
-      .from('autopilot_jobs')
-      .select('*')
-      .eq('customer_id', customer_id)
-      .eq('action_type', action_type)
-      .eq('status', 'pending')
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .single()
+    // 1. Récupère job + customer + founder + preferred_model en parallèle
+    const [jobResult, customerResult, founderResult, keyResult] = await Promise.all([
+      supabaseAdmin
+        .from('autopilot_jobs')
+        .select('*')
+        .eq('customer_id', customer_id)
+        .eq('action_type', action_type)
+        .eq('status', 'pending')
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .single(),
+      supabaseAdmin
+        .from('customers')
+        .select('*')
+        .eq('id', customer_id)
+        .single(),
+      supabaseAdmin
+        .from('users')
+        .select('product_name, first_name, preferred_model')
+        .eq('id', user_id)
+        .single(),
+      supabaseAdmin
+        .rpc('get_anthropic_key', { p_user_id: user_id })
+    ])
 
-    if (jobError || !job) {
+    if (jobResult.error || !jobResult.data) {
       return json({ error: 'Job not found' }, 404)
     }
 
-    // 2. Récupère le customer
-    const { data: customer, error: customerError } = await supabaseAdmin
-      .from('customers')
-      .select('*')
-      .eq('id', customer_id)
-      .single()
-
-    if (customerError || !customer) {
+    if (customerResult.error || !customerResult.data) {
       return json({ error: 'Customer not found' }, 404)
     }
 
-    // 3. Récupère le contexte produit du founder
-    const { data: founder, error: founderError } = await supabaseAdmin
-      .from('users')
-      .select('product_name, first_name')
-      .eq('id', user_id)
-      .single()
-
-    if (founderError || !founder) {
+    if (founderResult.error || !founderResult.data) {
       return json({ error: 'Founder not found' }, 404)
     }
 
-    // 4. Récupère la clé Anthropic
-    const { data: anthropic_key } = await supabaseAdmin
-      .rpc('get_anthropic_key', { p_user_id: user_id })
+    const job = jobResult.data
+    const customer = customerResult.data
+    const founder = founderResult.data
+    const anthropic_key = keyResult.data
+    const model = resolveModel('NARRATIVE', founder.preferred_model)
 
-    // 5. Génère l'intervention
+    // 2. Génère l'intervention
     let intervention: any
 
     if (anthropic_key) {
       const anthropic = new Anthropic({ apiKey: anthropic_key })
       intervention = await generateIntervention(
         anthropic,
+        model,
         action_type,
         customer,
         founder,
@@ -125,7 +126,7 @@ Deno.serve(async (req) => {
       intervention = buildFallbackIntervention(action_type, customer, founder)
     }
 
-    // 6. Update le job → ready
+    // 3. Update le job → ready
     const { error: updateError } = await supabaseAdmin
       .from('autopilot_jobs')
       .update({
@@ -146,12 +147,13 @@ Deno.serve(async (req) => {
     console.log(JSON.stringify({
       event: 'autopilot-intervene.completed',
       job_id: job.id,
+      model,
       action_type,
       customer_id,
       used_claude: !!anthropic_key
     }))
 
-    // 7. Déclenche autopilot-deploy/ — fire and forget
+    // 4. Déclenche autopilot-deploy/ — fire and forget
     supabaseAdmin.functions.invoke('autopilot-deploy', {
       body: { job_id: job.id, user_id }
     }).catch((err) => {
@@ -178,6 +180,7 @@ Deno.serve(async (req) => {
 
 async function generateIntervention(
   anthropic: Anthropic,
+  model: string,
   action_type: string,
   customer: any,
   founder: any,
@@ -187,7 +190,7 @@ async function generateIntervention(
 
   try {
     const response = await anthropic.messages.create({
-      model: MODEL,
+      model,
       max_tokens: 512,
       temperature: 0,
       messages: [{ role: 'user', content: prompt }]
@@ -202,7 +205,6 @@ async function generateIntervention(
 
     const parsed = JSON.parse(match[0])
 
-    // Valide les champs requis
     if (!parsed.subject || !parsed.body) {
       throw new Error('Missing required fields in intervention')
     }
@@ -213,6 +215,7 @@ async function generateIntervention(
     console.error(JSON.stringify({
       event: 'claude.intervention.failed',
       action_type,
+      model,
       error: err.message
     }))
     return buildFallbackIntervention(action_type, customer, founder)
@@ -293,7 +296,7 @@ function buildFallbackIntervention(
     subject: template.subject.replace('{{product_name}}', productName),
     body: template.body
       .replace(/{{product_name}}/g, productName)
-      .replace(/{{first_name}}/g, '{{first_name}}'), // gardé pour deploy
+      .replace(/{{first_name}}/g, '{{first_name}}'),
     delay_hours: template.delay_hours
   }
 }
@@ -303,4 +306,4 @@ function json(data: object, status: number) {
     status,
     headers: { 'Content-Type': 'application/json' }
   })
-}
+    }
