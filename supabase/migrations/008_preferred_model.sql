@@ -13,3 +13,7 @@ alter table public.users
       'claude-3-5-sonnet-20241022'
     )
   );
+
+alter table public.users
+  add column stripe_key_type text default 'restricted'
+  -- 'restricted' | 'connect'
