@@ -3,10 +3,9 @@ FROM denoland/deno:1.44.4
 WORKDIR /app
 
 COPY supabase/functions ./functions
-COPY supabase/functions/deno.json ./deno.json
-COPY supabase/functions/deno.lock ./deno.lock
+COPY deno.json ./deno.json
 
-RUN deno cache --lock=deno.lock functions/*/index.ts
+RUN deno cache functions/*/index.ts
 
 EXPOSE 8000
 
