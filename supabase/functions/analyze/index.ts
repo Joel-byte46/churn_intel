@@ -1,7 +1,7 @@
 import { supabaseAdmin } from '../_shared/clients.ts'
 import Anthropic from 'https://esm.sh/@anthropic-ai/sdk@0.27?target=deno'
+import { resolveModel } from '../_shared/config.ts'
 
-const MODEL = 'claude-3-5-sonnet-20241022'
 const MAX_TOKENS = 1024
 const MIN_CONFIDENCE = 60
 
@@ -13,17 +13,27 @@ Deno.serve(async (req) => {
       return json({ error: 'Missing user_id or analysis_id' }, 400)
     }
 
-    // 1. Récupère l'analyse
-    const { data: analysis, error: fetchError } = await supabaseAdmin
-      .from('churn_analyses')
-      .select('*')
-      .eq('id', analysis_id)
-      .eq('user_id', user_id)
-      .single()
+    // 1. Récupère l'analyse + le preferred_model du founder en une requête
+    const [analysisResult, userResult] = await Promise.all([
+      supabaseAdmin
+        .from('churn_analyses')
+        .select('*')
+        .eq('id', analysis_id)
+        .eq('user_id', user_id)
+        .single(),
+      supabaseAdmin
+        .from('users')
+        .select('preferred_model')
+        .eq('id', user_id)
+        .single()
+    ])
 
-    if (fetchError || !analysis) {
+    if (analysisResult.error || !analysisResult.data) {
       return json({ error: 'Analysis not found' }, 404)
     }
+
+    const analysis = analysisResult.data
+    const model = resolveModel('ANALYSIS', userResult.data?.preferred_model)
 
     // 2. Update status → analyzing
     await supabaseAdmin
@@ -58,7 +68,6 @@ Deno.serve(async (req) => {
         })
         .eq('id', analysis_id)
 
-      // Déclenche report quand même — le founder mérite son email
       supabaseAdmin.functions.invoke('report', {
         body: { user_id, analysis_id }
       }).catch(() => {})
@@ -72,15 +81,15 @@ Deno.serve(async (req) => {
     // 6. Claude Call 1 — Pattern Detection
     let pattern: any
     try {
-      pattern = await callClaude(anthropic, buildPatternPrompt(context))
+      pattern = await callClaude(anthropic, model, buildPatternPrompt(context))
     } catch (err) {
       console.error(JSON.stringify({
         event: 'claude.pattern.failed',
         user_id,
         analysis_id,
+        model,
         error: err.message
       }))
-      // Fallback pattern
       pattern = {
         primary_pattern: 'unknown',
         trigger_point: 'undetermined',
@@ -97,6 +106,7 @@ Deno.serve(async (req) => {
     try {
       diagnosis = await callClaude(
         anthropic,
+        model,
         buildDiagnosisPrompt(context, pattern)
       )
     } catch (err) {
@@ -104,9 +114,9 @@ Deno.serve(async (req) => {
         event: 'claude.diagnosis.failed',
         user_id,
         analysis_id,
+        model,
         error: err.message
       }))
-      // Fallback diagnosis avec les chiffres bruts
       const mrrLost = churned.reduce((s, c) => s + (c.mrr ?? 0), 0)
       diagnosis = {
         monthly_revenue_at_risk: mrrLost,
@@ -134,6 +144,7 @@ Deno.serve(async (req) => {
       event: 'analyze.completed',
       user_id,
       analysis_id,
+      model,
       pattern: pattern.primary_pattern,
       confidence: pattern.confidence,
       low_confidence: lowConfidence
@@ -240,13 +251,14 @@ Return ONLY valid JSON:
 
 async function callClaude(
   anthropic: Anthropic,
+  model: string,
   prompt: string,
   retries = 2
 ): Promise<any> {
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
       const response = await anthropic.messages.create({
-        model: MODEL,
+        model,
         max_tokens: MAX_TOKENS,
         temperature: 0,
         messages: [{ role: 'user', content: prompt }]
@@ -256,7 +268,6 @@ async function callClaude(
         ? response.content[0].text
         : ''
 
-      // Extrait le JSON même si Claude ajoute du texte autour
       const match = text.match(/\{[\s\S]*\}/)
       if (!match) throw new Error('No JSON found in Claude response')
 
@@ -264,7 +275,6 @@ async function callClaude(
 
     } catch (err) {
       if (attempt === retries) throw err
-      // Exponential backoff : 1s, 4s
       await sleep(1000 * Math.pow(4, attempt))
     }
   }
@@ -292,4 +302,4 @@ function json(data: object, status: number) {
     status,
     headers: { 'Content-Type': 'application/json' }
   })
-}
+        }
