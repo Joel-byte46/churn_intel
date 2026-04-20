@@ -51,3 +51,21 @@ revoke execute on function get_anthropic_key   from public;
 
 grant execute on function store_anthropic_key to service_role;
 grant execute on function get_anthropic_key   to service_role;
+
+
+create or replace function increment_mrr_protected(
+  p_user_id uuid,
+  p_amount  decimal
+)
+returns void
+language plpgsql
+security definer
+as $$
+begin
+  update public.founder_metrics
+  set cumulative_mrr_protected = cumulative_mrr_protected + p_amount
+  where user_id = p_user_id;
+end;
+$$;
+
+grant execute on function increment_mrr_protected to service_role;
