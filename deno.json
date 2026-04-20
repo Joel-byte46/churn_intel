@@ -1,0 +1,11 @@
+{
+  "lint": {
+    "rules": {
+      "exclude": [
+        "no-unused-vars",
+        "require-await",
+        "prefer-const"
+      ]
+    }
+  }
+}
