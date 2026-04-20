@@ -1,9 +1,7 @@
 import { supabaseAdmin } from '../_shared/clients.ts'
-import Anthropic from 'https://esm.sh/@anthropic-ai/sdk@0.27?target=deno'
 
-const MODEL = 'claude-3-5-sonnet-20241022'
 const RESEND_URL = 'https://api.resend.com/emails'
-const DIGEST_THRESHOLD = 3 // Digest fondateur si > 3 jobs déployés en 24h
+const DIGEST_THRESHOLD = 3
 
 Deno.serve(async (req) => {
   try {
@@ -13,30 +11,54 @@ Deno.serve(async (req) => {
       return json({ error: 'Missing job_id or user_id' }, 400)
     }
 
-    // 1. Récupère le job complet
-    const { data: job, error: jobError } = await supabaseAdmin
-      .from('autopilot_jobs')
-      .select('*')
-      .eq('id', job_id)
-      .eq('status', 'ready')
-      .single()
+    // 1. Récupère job + customer + founder en parallèle
+    const [jobResult, customerResult, founderResult] = await Promise.all([
+      supabaseAdmin
+        .from('autopilot_jobs')
+        .select('*')
+        .eq('id', job_id)
+        .eq('status', 'ready')
+        .single(),
+      supabaseAdmin
+        .from('customers')
+        .select('email, stripe_customer_id, invalid_email, interventions_count')
+        .eq('id', job_id)
+        .single(),
+      supabaseAdmin
+        .from('users')
+        .select('email, first_name, product_name')
+        .eq('id', user_id)
+        .single()
+    ])
 
-    if (jobError || !job) {
+    if (jobResult.error || !jobResult.data) {
       return json({ error: 'Job not found or not ready' }, 404)
     }
 
-    // 2. Récupère le customer
-    const { data: customer, error: customerError } = await supabaseAdmin
-      .from('customers')
-      .select('email, stripe_customer_id, invalid_email')
-      .eq('id', job.customer_id)
-      .single()
+    const job = jobResult.data
 
-    if (customerError || !customer) {
-      return json({ error: 'Customer not found' }, 404)
+    // 2. Récupère le customer via job.customer_id si nécessaire
+    let customer = customerResult.data
+    if (!customer) {
+      const { data, error } = await supabaseAdmin
+        .from('customers')
+        .select('email, stripe_customer_id, invalid_email, interventions_count')
+        .eq('id', job.customer_id)
+        .single()
+
+      if (error || !data) {
+        return json({ error: 'Customer not found' }, 404)
+      }
+      customer = data
     }
 
-    // Guard : email invalide
+    if (founderResult.error || !founderResult.data) {
+      return json({ error: 'Founder not found' }, 404)
+    }
+
+    const founder = founderResult.data
+
+    // 3. Guard : email invalide
     if (customer.invalid_email || !customer.email) {
       await supabaseAdmin
         .from('autopilot_jobs')
@@ -52,17 +74,6 @@ Deno.serve(async (req) => {
       return json({ status: 'skipped', reason: 'invalid_email' }, 200)
     }
 
-    // 3. Récupère le founder pour son email
-    const { data: founder, error: founderError } = await supabaseAdmin
-      .from('users')
-      .select('email, first_name, product_name')
-      .eq('id', user_id)
-      .single()
-
-    if (founderError || !founder) {
-      return json({ error: 'Founder not found' }, 404)
-    }
-
     const intervention = job.intervention as any
     const resendKey = Deno.env.get('RESEND_API_KEY')!
 
@@ -72,7 +83,6 @@ Deno.serve(async (req) => {
       .replace(/{{first_name}}/g, customerFirstName)
 
     // 5. Envoie l'email au customer
-    // Avec délai si intervention.delay_hours > 0
     const delayHours = intervention.delay_hours ?? 0
     const scheduledAt = delayHours > 0
       ? new Date(Date.now() + delayHours * 3600000).toISOString()
@@ -87,7 +97,6 @@ Deno.serve(async (req) => {
     )
 
     if (!sent) {
-      // Marque l'email comme invalide si échec répété
       await supabaseAdmin
         .from('customers')
         .update({ invalid_email: true })
@@ -109,24 +118,24 @@ Deno.serve(async (req) => {
 
     const now = new Date().toISOString()
 
-    // 6. Update le job → deployed
-    await supabaseAdmin
-      .from('autopilot_jobs')
-      .update({
-        status: 'deployed',
-        deployed_at: now
-      })
-      .eq('id', job_id)
-
-    // 7. Update le customer
-    await supabaseAdmin
-      .from('customers')
-      .update({
-        last_intervention_at: now,
-        last_intervention_type: job.action_type,
-        interventions_count: (customer as any).interventions_count + 1
-      })
-      .eq('id', job.customer_id)
+    // 6. Update job + customer
+    await Promise.all([
+      supabaseAdmin
+        .from('autopilot_jobs')
+        .update({
+          status: 'deployed',
+          deployed_at: now
+        })
+        .eq('id', job_id),
+      supabaseAdmin
+        .from('customers')
+        .update({
+          last_intervention_at: now,
+          last_intervention_type: job.action_type,
+          interventions_count: (customer.interventions_count ?? 0) + 1
+        })
+        .eq('id', job.customer_id)
+    ])
 
     console.log(JSON.stringify({
       event: 'autopilot-deploy.completed',
@@ -136,13 +145,8 @@ Deno.serve(async (req) => {
       delay_hours: delayHours
     }))
 
-    // 8. Vérifie si digest founder nécessaire
+    // 7. Vérifie si digest founder nécessaire
     await maybeNotifyFounder(user_id, founder, resendKey, job)
-
-    // 9. Schedule impact check J+7 via pg_cron
-    // On stocke la date cible — autopilot-measure/ tourne toutes les nuits
-    // et récupère les jobs deployed_at = 7 jours ago
-    // Pas de cron dynamique nécessaire
 
     return json({ status: 'deployed', job_id }, 200)
 
@@ -164,7 +168,6 @@ async function maybeNotifyFounder(
   resendKey: string,
   lastJob: any
 ) {
-  // Compte les jobs déployés dans les dernières 24h
   const { data: recentJobs, error } = await supabaseAdmin
     .from('autopilot_jobs')
     .select('id, action_type, health_score, customer_id')
@@ -178,10 +181,8 @@ async function maybeNotifyFounder(
   const isCritical = lastJob.action_type === 'WIN_BACK' ||
     lastJob.health_score < 20
 
-  // Notifie si seuil atteint ou job critique
   if (jobCount < DIGEST_THRESHOLD && !isCritical) return
 
-  // Compte par type pour le digest
   const byType = recentJobs.reduce((acc: Record<string, number>, job: any) => {
     acc[job.action_type] = (acc[job.action_type] ?? 0) + 1
     return acc
@@ -244,9 +245,6 @@ All running while you build. Check /autopilot for results.
 // --- Helpers ---
 
 function extractFirstName(email: string): string {
-  // Extrait un prénom approximatif depuis l'email
-  // john.doe@company.com → John
-  // john@company.com → John
   const local = email.split('@')[0]
   const first = local.split(/[._-]/)[0]
   return first.charAt(0).toUpperCase() + first.slice(1).toLowerCase()
@@ -317,4 +315,4 @@ function json(data: object, status: number) {
     status,
     headers: { 'Content-Type': 'application/json' }
   })
-}
+        }
