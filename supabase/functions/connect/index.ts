@@ -11,40 +11,33 @@ Deno.serve(async (req) => {
       return json({ error: 'Missing user_id' }, 400)
     }
 
-    // 1. Récupère le user + son token Stripe
-    const { data: user, error: userError } = await supabaseAdmin
-      .from('users')
-      .select('id, email, stripe_access_token, stripe_account_id')
-      .eq('id', user_id)
-      .single()
+    // 1. Récupère la Stripe Restricted Key depuis Vault
+    const { data: stripe_key, error: keyError } = await supabaseAdmin
+      .rpc('get_stripe_key', { p_user_id: user_id })
 
-    if (userError || !user) {
-      return json({ error: 'User not found' }, 404)
+    if (keyError || !stripe_key) {
+      return json({ error: 'Stripe key not configured' }, 400)
     }
 
-    if (!user.stripe_access_token) {
-      return json({ error: 'Stripe not connected' }, 400)
-    }
-
-    const stripe = new Stripe(user.stripe_access_token, {
+    const stripe = new Stripe(stripe_key, {
       apiVersion: '2023-10-16',
       httpClient: Stripe.createFetchHttpClient()
     })
 
     const since = Math.floor(Date.now() / 1000) - LOOKBACK_DAYS * 86400
 
-    // 2. Pull les subscriptions annulées (90 jours)
-    const churned = await pullChurned(stripe, since)
+    // 2. Pull les subscriptions annulées (90 jours) + actives en parallèle
+    const [churned, active] = await Promise.all([
+      pullChurned(stripe, since),
+      pullActive(stripe)
+    ])
 
-    // 3. Pull les subscriptions actives
-    const active = await pullActive(stripe)
-
-    // 4. Calcule le MRR total
+    // 3. Calcule le MRR total
     const totalMrr = active.reduce((sum, s) => {
       return sum + normalizeToMonthly(s.items.data[0]?.price)
     }, 0)
 
-    // 5. Normalise les customers churned
+    // 4. Normalise les customers churned
     const churnedCustomers = churned.map((s) => ({
       stripe_customer_id: s.customer as string,
       canceled_at: s.canceled_at,
@@ -55,16 +48,14 @@ Deno.serve(async (req) => {
       cancel_comment: s.cancellation_details?.comment ?? null
     }))
 
-    // 6. Upsert les customers actifs
+    // 5. Upsert les customers actifs
     if (active.length > 0) {
       const customersToUpsert = active.map((s) => ({
         user_id,
         stripe_customer_id: s.customer as string,
         mrr: normalizeToMonthly(s.items.data[0]?.price),
         plan_name: s.items.data[0]?.price?.nickname ?? 'unknown',
-        tenure_days: Math.floor(
-          (Date.now() / 1000 - s.created) / 86400
-        ),
+        tenure_days: Math.floor((Date.now() / 1000 - s.created) / 86400),
         updated_at: new Date().toISOString()
       }))
 
@@ -83,7 +74,7 @@ Deno.serve(async (req) => {
       }
     }
 
-    // 7. Crée l'analyse avec status pending
+    // 6. Crée l'analyse avec status pending
     const { data: analysis, error: analysisError } = await supabaseAdmin
       .from('churn_analyses')
       .insert({
@@ -109,7 +100,7 @@ Deno.serve(async (req) => {
       total_mrr: totalMrr
     }))
 
-    // 8. Déclenche analyze/ — fire and forget
+    // 7. Déclenche analyze/ — fire and forget
     supabaseAdmin.functions.invoke('analyze', {
       body: { user_id, analysis_id: analysis.id }
     }).catch((err) => {
@@ -203,4 +194,4 @@ function json(data: object, status: number) {
     status,
     headers: { 'Content-Type': 'application/json' }
   })
-}
+        }
