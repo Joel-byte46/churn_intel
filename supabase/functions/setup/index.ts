@@ -117,3 +117,32 @@ function json(data: object, status: number) {
     headers: { 'Content-Type': 'application/json' }
   })
   }
+
+
+
+const { anthropic_key, stripe_key } = await req.json()
+
+// Valide la Stripe Restricted Key
+const stripeTest = await fetch('https://api.stripe.com/v1/subscriptions?limit=1', {
+  headers: {
+    'Authorization': `Bearer ${stripe_key}`
+  }
+})
+
+if (!stripeTest.ok) {
+  return json({ error: 'Invalid Stripe key' }, 400)
+}
+
+// Stocke dans Vault
+await supabaseAdmin.rpc('store_stripe_key', {
+  p_user_id: user.id,
+  p_key: stripe_key
+})
+
+await supabaseAdmin
+  .from('users')
+  .update({
+    stripe_key_type: 'restricted',
+    setup_completed: true
+  })
+  .eq('id', user.id)
