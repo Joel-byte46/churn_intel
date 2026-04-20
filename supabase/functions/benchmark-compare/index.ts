@@ -1,11 +1,9 @@
 import { supabaseAdmin } from '../_shared/clients.ts'
 import Anthropic from 'https://esm.sh/@anthropic-ai/sdk@0.27?target=deno'
+import { resolveModel } from '../_shared/config.ts'
 
-const MODEL = 'claude-3-5-sonnet-20241022'
 const MIN_PEERS = 5
 
-// Données industrie publiques par bracket
-// Fallback quand pas assez de peers dans la DB
 const INDUSTRY_BENCHMARKS: Record<string, any> = {
   '0-1K': {
     median_churn_rate: 8.5,
@@ -45,36 +43,46 @@ Deno.serve(async (req) => {
       return json({ error: 'Missing user_id' }, 400)
     }
 
-    // 1. Récupère les métriques du founder
-    const { data: founder, error: founderError } = await supabaseAdmin
-      .from('founder_metrics')
-      .select('*')
-      .eq('user_id', user_id)
-      .single()
+    // 1. Récupère les métriques du founder + preferred_model en parallèle
+    const [founderResult, userResult, peersResult] = await Promise.all([
+      supabaseAdmin
+        .from('founder_metrics')
+        .select('*')
+        .eq('user_id', user_id)
+        .single(),
+      supabaseAdmin
+        .from('users')
+        .select('preferred_model')
+        .eq('id', user_id)
+        .single(),
+      supabaseAdmin
+        .from('founder_metrics')
+        .select('churn_rate, avg_customer_tenure, mrr_lost_30d, mrr')
+        .neq('user_id', user_id)
+    ])
 
-    if (founderError || !founder) {
+    if (founderResult.error || !founderResult.data) {
       return json({ error: 'Founder metrics not found' }, 404)
     }
 
-    // 2. Récupère les peers anonymisés dans le même bracket
-    const { data: peers, error: peersError } = await supabaseAdmin
-      .from('founder_metrics')
-      .select('churn_rate, avg_customer_tenure, mrr_lost_30d, mrr')
-      .eq('mrr_bracket', founder.mrr_bracket)
-      .neq('user_id', user_id)
+    const founder = founderResult.data
+    const model = resolveModel('ANALYSIS', userResult.data?.preferred_model)
 
-    if (peersError) {
+    // 2. Filtre les peers du même bracket
+    // Fait côté JS pour éviter une seconde requête après avoir le bracket
+    if (peersResult.error) {
       console.error(JSON.stringify({
         event: 'peers.fetch.failed',
         user_id,
-        error: peersError.message
+        error: peersResult.error.message
       }))
     }
 
-    const validPeers = peers ?? []
+    const validPeers = (peersResult.data ?? []).filter(
+      (p: any) => p.mrr_bracket === founder.mrr_bracket
+    )
 
     // 3. Calcule les benchmarks
-    // Utilise peers réels si assez, sinon industrie
     const benchmark = validPeers.length >= MIN_PEERS
       ? computePeerBenchmark(founder, validPeers)
       : computeIndustryBenchmark(founder, INDUSTRY_BENCHMARKS[founder.mrr_bracket])
@@ -88,7 +96,7 @@ Deno.serve(async (req) => {
 
     if (anthropic_key) {
       const anthropic = new Anthropic({ apiKey: anthropic_key })
-      reading = await generateReading(anthropic, founder, benchmark, validPeers.length)
+      reading = await generateReading(anthropic, model, founder, benchmark, validPeers.length)
     } else {
       reading = buildFallbackReading(founder, benchmark)
     }
@@ -115,6 +123,7 @@ Deno.serve(async (req) => {
     console.log(JSON.stringify({
       event: 'benchmark-compare.completed',
       user_id,
+      model,
       peer_count: validPeers.length,
       position: reading.position,
       using_industry_data: validPeers.length < MIN_PEERS
@@ -146,8 +155,8 @@ Deno.serve(async (req) => {
 // --- Calculs ---
 
 function computePeerBenchmark(founder: any, peers: any[]) {
-  const churnRates = peers.map(p => p.churn_rate).sort((a, b) => a - b)
-  const tenures = peers.map(p => p.avg_customer_tenure).sort((a, b) => a - b)
+  const churnRates = peers.map((p: any) => p.churn_rate).sort((a: number, b: number) => a - b)
+  const tenures = peers.map((p: any) => p.avg_customer_tenure).sort((a: number, b: number) => a - b)
 
   const median = (arr: number[]) => {
     const mid = Math.floor(arr.length / 2)
@@ -163,12 +172,8 @@ function computePeerBenchmark(founder: any, peers: any[]) {
 
   const medianChurn = median(churnRates)
   const founderChurn = founder.churn_rate
-
-  // Position dans le bracket
-  const betterThan = churnRates.filter(r => r > founderChurn).length
+  const betterThan = churnRates.filter((r: number) => r > founderChurn).length
   const percentileRank = Math.round((betterThan / peers.length) * 100)
-
-  // Gap vers le top quartile (p25 = meilleurs)
   const topQuartileChurn = percentile(churnRates, 25)
   const mrrGap = founder.mrr > 0
     ? ((founderChurn - topQuartileChurn) / 100) * founder.mrr
@@ -195,12 +200,11 @@ function computeIndustryBenchmark(founder: any, industry: any) {
     ? ((founderChurn - industry.p25_churn_rate) / 100) * founder.mrr
     : 0
 
-  // Percentile approximé vs industrie
   let percentileRank = 50
-  if (founderChurn <= industry.p25_churn_rate) percentileRank = 80
+  if (founderChurn <= industry.p25_churn_rate)      percentileRank = 80
   else if (founderChurn <= industry.median_churn_rate) percentileRank = 55
-  else if (founderChurn <= industry.p75_churn_rate) percentileRank = 30
-  else percentileRank = 10
+  else if (founderChurn <= industry.p75_churn_rate)    percentileRank = 30
+  else                                                  percentileRank = 10
 
   return {
     source: 'industry',
@@ -221,6 +225,7 @@ function computeIndustryBenchmark(founder: any, industry: any) {
 
 async function generateReading(
   anthropic: Anthropic,
+  model: string,
   founder: any,
   benchmark: any,
   peerCount: number
@@ -251,7 +256,7 @@ Return ONLY valid JSON:
 
   try {
     const response = await anthropic.messages.create({
-      model: MODEL,
+      model,
       max_tokens: 256,
       temperature: 0,
       messages: [{ role: 'user', content: prompt }]
@@ -290,4 +295,4 @@ function json(data: object, status: number) {
     status,
     headers: { 'Content-Type': 'application/json' }
   })
-}
+      }
